@@ -12,13 +12,13 @@ use frame_system::{
 	self as system, ensure_none,
 	offchain::{
 		CreateSignedTransaction, SendUnsignedTransaction, SignedPayload, Signer,
-		SigningTypes,
+		SigningTypes, SendSignedTransaction
 	},
 };
 use sp_core::crypto::KeyTypeId;
 use sp_runtime::{
 	offchain::{http, storage::StorageValueRef, Duration},
-	traits::{Convert, IdentifyAccount},
+	traits::{Convert, IdentifyAccount, StaticLookup},
 	transaction_validity::{
 		InvalidTransaction, TransactionPriority, TransactionSource, TransactionValidity,
 		ValidTransaction,
@@ -28,7 +28,7 @@ use sp_runtime::{
 use sp_std::{prelude::*, vec::Vec};
 
 use codec::{Decode, Encode};
-use lite_json::json::JsonValue;
+use lite_json::json::{JsonValue, NumberValue};
 
 #[cfg(test)]
 mod mock;
@@ -67,7 +67,7 @@ pub enum MotherchainType {
 }
 
 /// This pallet's configuration trait
-pub trait Config: CreateSignedTransaction<Call<Self>> + pallet_session::Config {
+pub trait Config: CreateSignedTransaction<Call<Self>> + pallet_session::Config + pallet_assets::Config {
 	/// The identifier type for an offchain worker.
 	type AppCrypto: frame_system::offchain::AppCrypto<Self::Public, Self::Signature>;
 
@@ -75,9 +75,7 @@ pub trait Config: CreateSignedTransaction<Call<Self>> + pallet_session::Config {
 	type Event: From<Event<Self>> + Into<<Self as frame_system::Config>::Event>;
 	/// The overarching dispatch call type.
 	type Call: From<Call<Self>>;
-
-	// Configuration parameters
-
+	
 	/// The id assigned by motherchain to this appchain.
 	type AppchainId: Get<ChainId>;
 
@@ -86,6 +84,9 @@ pub trait Config: CreateSignedTransaction<Call<Self>> + pallet_session::Config {
 
 	/// The name/address of the relay contract on the motherchain.
 	const RELAY_CONTRACT_NAME: &'static [u8];
+
+	/// The name/address of the locker contract on the motherchain.
+    const LOCKER_CONTRACT_NAME: &'static [u8];
 
 	/// A grace period after we send transaction.
 	///
@@ -119,6 +120,15 @@ pub struct ValidatorSet<AccountId> {
 	validators: Vec<Validator<AccountId>>,
 }
 
+/// The locked record of appchain
+#[derive(Encode, Decode, Clone, PartialEq, Eq, RuntimeDebug)]
+pub struct LockedEvent<AccountId> {
+	sequence_number: u32,
+	token_id: Vec<u8>,
+    receiver_id: AccountId,
+    amount: u64,
+}
+
 /// Payload used by this crate to hold validator set
 /// data required to submit a transaction.
 #[derive(Encode, Decode, Clone, PartialEq, Eq, RuntimeDebug)]
@@ -128,8 +138,23 @@ pub struct ValidatorSetPayload<Public, BlockNumber, AccountId> {
 	val_set: ValidatorSet<AccountId>,
 }
 
+#[derive(Encode, Decode, Clone, PartialEq, Eq, RuntimeDebug)]
+pub struct LockedEventsPayload<Public, BlockNumber, AccountId> {
+    public: Public,
+    block_number: BlockNumber,
+    events: Vec<LockedEvent<AccountId>>,
+}
+
 impl<T: SigningTypes> SignedPayload<T>
 	for ValidatorSetPayload<T::Public, T::BlockNumber, <T as frame_system::Config>::AccountId>
+{
+	fn public(&self) -> T::Public {
+		self.public.clone()
+	}
+}
+
+impl<T: SigningTypes> SignedPayload<T>
+	for LockedEventsPayload<T::Public, T::BlockNumber, <T as frame_system::Config>::AccountId>
 {
 	fn public(&self) -> T::Public {
 		self.public.clone()
@@ -146,6 +171,11 @@ decl_storage! {
 		Voters get(fn voters):
 		map hasher(twox_64_concat) u32
 		=> Vec<Validator<<T as frame_system::Config>::AccountId>>;
+
+		LockedEvents get(fn locked_events): 
+        map hasher(twox_64_concat) u32 => Option<LockedEvent<<T as frame_system::Config>::AccountId>>;
+
+        LockedEventsLength get(fn locked_events_length): u32 = 0;
 	}
 	add_extra_genesis {
 		config(validators): Vec<(<T as frame_system::Config>::AccountId, u64)>;
@@ -181,6 +211,29 @@ decl_module! {
 	/// A public part of the pallet.
 	pub struct Module<T: Config> for enum Call where origin: T::Origin {
 		fn deposit_event() = default;
+
+		#[weight = 0]
+		pub fn mint_token(
+			origin,
+			receriver_id: T::AccountId,
+			token_id: Vec<u8>,
+			amount: u64
+		) -> DispatchResult {
+			let receiver = <T::Lookup as StaticLookup>::unlookup(receriver_id.clone());
+			let asset_id = <T as pallet_assets::Config>::AssetIdOf::convert(0).unwrap();
+			let amount = <T as pallet_assets::Config>::BalanceOf::convert(amount).unwrap();
+			
+			let token_id = sp_std::str::from_utf8(&token_id).unwrap_or("UNKNOWN");
+
+			let result = <pallet_assets::Pallet<T>>::mint(origin, asset_id, receiver.clone(), amount.into());
+			log::info!(
+				"️️️🐙 mint {:#?} to {:#?}, result: {:#?}",
+				token_id,
+				receiver,
+				result
+			);
+			Ok(())
+		}
 
 		/// Submit a new set of validators and vote on this set.
 		///
@@ -238,6 +291,26 @@ decl_module! {
 			Ok(())
 		}
 
+		#[weight = 0]
+		pub fn submit_locked_events(
+			origin,
+			payload: LockedEventsPayload<T::Public, T::BlockNumber, <T as frame_system::Config>::AccountId>,
+			_signature: T::Signature,
+		) -> DispatchResult {
+            ensure_none(origin)?;
+            let events: Vec<LockedEvent<<T as frame_system::Config>::AccountId>> = payload.events.clone();
+
+            let mut start_idx = Self::locked_events_length();
+            for event in events.iter() {
+                <LockedEvents<T>>::insert(start_idx, event);
+                start_idx += 1;
+            }
+
+            LockedEventsLength::put(start_idx);
+            log::info!("🐙 Locked Events Updated! Events length: {:?}", start_idx);
+            Ok(())
+        }
+
 		/// Offchain Worker entry point.
 		///
 		/// By implementing `fn offchain_worker` within `decl_module!` you declare a new offchain
@@ -249,12 +322,22 @@ decl_module! {
 		/// so the code should be able to handle that.
 		/// You can use `Local Storage` API to coordinate runs of the worker.
 		fn offchain_worker(block_number: T::BlockNumber) {
-			let parent_hash = <system::Pallet<T>>::block_hash(block_number - 1u32.into());
-			log::info!("🐙 Current block: {:?} (parent hash: {:?})", block_number, parent_hash);
 
 			if !Self::should_send(block_number) {
 				return;
 			}
+
+			if let Err(e) = Self::fetch_and_update_locked_events(block_number) {
+                log::info!("🐙 Update lock events error: {}", e);
+            }
+
+			let appchain_id = T::AppchainId::get();
+			if appchain_id == 0 {
+				// detach appchain from motherchain when appchain_id == 0
+				return;
+			}
+			let parent_hash = <system::Pallet<T>>::block_hash(block_number - 1u32.into());
+			log::info!("🐙 Current block: {:?} (parent hash: {:?})", block_number, parent_hash);
 
 			let next_seq_num;
 			if let Some(cur_val_set) = <CurrentValidatorSet<T>>::get() {
@@ -351,6 +434,151 @@ impl<T: Config> Module<T> {
 			Ok(Err(_)) => false,
 		}
 	}
+
+	fn fetch_and_update_locked_events(
+        block_number: T::BlockNumber,
+    ) -> Result<(), &'static str> {
+
+        log::info!("🐙 in fetch_and_update_locked_events");
+
+        let start_index = Self::locked_events_length();
+        let events = Self::fetch_locked_events(
+            T::LOCKER_CONTRACT_NAME.to_vec(),
+            T::AppchainId::get(),
+            start_index,
+            10
+        )
+        .map_err(|_| "Failed to fetch locked events")?;
+
+        if events.len() <= 0 {
+            return Ok(());
+        }
+
+        log::info!(
+            "🐙 got locked events: {:#?}, appchain id: {:#?}, start index: {:#?}, events len: {:#?}", 
+            events, 
+            T::AppchainId::get(), 
+            start_index,
+            events.len()
+        );
+
+        // -- Sign using any account
+        let (_, result) = Signer::<T, T::AppCrypto>::any_account()
+            .send_unsigned_transaction(
+                |account| LockedEventsPayload {
+                    public: account.public.clone(),
+                    block_number,
+                    events: events.clone(),
+                },
+                |payload, signature| Call::submit_locked_events(payload, signature),
+            )
+            .ok_or("🐙 No local accounts accounts available.")?;
+        result.map_err(|()| "🐙 Unable to submit transaction")?;
+
+		// mint assets
+		
+		let signer = Signer::<T, T::AppCrypto>::all_accounts();
+		if !signer.can_sign() {
+			return Err(
+				"No local accounts available. Consider adding one via `author_insertKey` RPC."
+			)?
+		}
+		
+		for event in events.iter() {
+			
+			let _result =  Signer::<T, T::AppCrypto>::all_accounts()
+				.send_signed_transaction(
+					|_account| {
+						Call::mint_token(event.receiver_id.clone(), event.token_id.clone(), event.amount)
+					}
+				);
+        	// result.map_err(|()| "🐙 Unable to submit transaction")?;
+		}
+        
+        Ok(())
+       
+    }
+
+    fn fetch_locked_events(
+        locker_contract: Vec<u8>,
+        appchain_id: u32,
+        start: u32,
+        limit: u32,
+    ) -> Result<Vec<LockedEvent<<T as frame_system::Config>::AccountId>>, http::Error> {
+        let deadline = sp_io::offchain::timestamp().add(Duration::from_millis(2_000));
+		
+		let args = Self::encode_locked_args(appchain_id, start, limit).ok_or_else(|| {
+			log::info!("🐙 Encode args error");
+			http::Error::Unknown
+		})?;
+
+        let mut body = br#"
+		{
+			"jsonrpc": "2.0",
+			"id": "dontcare",
+			"method": "query",
+			"params": {
+				"request_type": "call_function",
+				"finality": "final",
+				"account_id": ""#
+			.to_vec();
+        body.extend(&locker_contract);
+        body.extend(
+			br#"",
+				"method_name": "get_locked_events",
+				"args_base64": ""#,
+		);
+		body.extend(&args);
+		body.extend(
+			br#""
+			}
+		}"#,
+		);
+
+        let request = http::Request::default()
+			.method(http::Method::Post)
+			.url("https://rpc.testnet.near.org")
+			.body(vec![body])
+			.add_header("Content-Type", "application/json");
+
+        let pending = request
+			.deadline(deadline)
+			.send()
+			.map_err(|_| http::Error::IoError)?;
+
+        let response = pending
+			.try_wait(deadline)
+			.map_err(|_| http::Error::DeadlineReached)??;
+
+        if response.code != 200 {
+            log::info!("🐙 Unexpected status code: {}", response.code);
+            return Err(http::Error::Unknown);
+        }
+
+        let body = response.body().collect::<Vec<u8>>();
+
+		// Create a str slice from the body.
+		let body_str = sp_std::str::from_utf8(&body).map_err(|_| {
+			log::info!("🐙 No UTF8 body");
+			http::Error::Unknown
+		})?;
+		log::info!("🐙 Got response: {:?}", body_str);
+
+        let events = match Self::parse_events(body_str) {
+			Some(e) => Ok(e),
+			None => {
+				log::info!(
+					"🐙 Unable to extract events from the response: {:?}",
+					body_str
+				);
+				Err(http::Error::Unknown)
+			}
+		}?;
+
+        log::info!("🐙 Got events: {:?}", events);
+
+        Ok(events)
+    }
 
 	fn fetch_and_update_validator_set(
 		block_number: T::BlockNumber,
@@ -493,6 +721,153 @@ impl<T: Config> Module<T> {
 		let res = base64::encode(json).into_bytes();
 		Some(res)
 	}
+
+	fn encode_locked_args(appchain_id: u32, start: u32, limit: u32) -> Option<Vec<u8>> {
+		let a = String::from("{\"appchain_id\":");
+		let appchain_id = appchain_id.to_string();
+		let b = String::from(",\"start\":");
+		let start = start.to_string();
+        let c = String::from(",\"limit\":");
+        let limit = limit.to_string();
+		let d = String::from("}");
+		let json = a + &appchain_id + &b + &start + &c + &limit + &d;
+		let res = base64::encode(json).into_bytes();
+		Some(res)
+	}
+
+	fn parse_events(
+        body_str: &str,
+    ) -> Option<Vec<LockedEvent<<T as frame_system::Config>::AccountId>>> {
+        let result = Self::extract_result(body_str).ok_or_else(|| {
+			log::info!("🐙 Can't extract result from body");
+			Option::<ValidatorSet<<T as frame_system::Config>::AccountId>>::None
+		}).ok()?;
+
+		let result_str = sp_std::str::from_utf8(&result).map_err(|_| {
+			log::info!("🐙 No UTF8 result");
+			Option::<ValidatorSet<<T as frame_system::Config>::AccountId>>::None
+		}).ok()?;
+
+		log::info!("🐙 Got result: {:?}", result_str);
+
+        let val = lite_json::parse_json(result_str);
+        let mut events: Vec<LockedEvent<<T as frame_system::Config>::AccountId>> = vec![];
+        val.ok().and_then(|v| match v {
+            JsonValue::Array(arr) => {
+                arr.iter().for_each(|v| match v {
+                    JsonValue::Object(obj) => {
+                        let seq_num = obj
+                            .clone()
+                            .into_iter()
+                            .find(|(k, _)| {
+                                let mut seq_num = "seq_num".chars();
+                                k.iter().all(|k| Some(*k) == seq_num.next())
+                            })
+                            .and_then(|v| match v.1 {
+                                JsonValue::Number(number) => Some(number),
+                                _ => None,
+                            });
+                        let token_id = obj
+                            .clone()
+                            .into_iter()
+                            .find(|(k, _)| {
+                                let mut seq_num = "token_id".chars();
+                                k.iter().all(|k| Some(*k) == seq_num.next())
+                            })
+                            .and_then(|v| match v.1 {
+                                JsonValue::String(s) => {
+                                    let data: Vec<u8> = s
+                                        .iter()
+                                        .map(|c| *c as u8)
+                                        .collect::<Vec<_>>();
+                                    Some(data)
+                                },
+                                _ => None,
+                            });
+                        let _appchain_id = obj
+                            .clone()
+                            .into_iter()
+                            .find(|(k, _)| {
+                                let mut appchain_id = "appchain_id".chars();
+                                k.iter().all(|k| Some(*k) == appchain_id.next())
+                            })
+                            .and_then(|v| match v.1 {
+                                JsonValue::Number(number) => Some(number),
+                                _ => None,
+                            });
+                        let receiver_id = obj
+                            .clone()
+                            .into_iter()
+                            .find(|(k, _)| {
+                                let mut id = "receiver_id".chars();
+                                k.iter().all(|k| Some(*k) == id.next())
+                            })
+                            .and_then(|v| match v.1 {
+                                JsonValue::String(s) => {
+                                    let data: Vec<u8> = s
+                                        .iter()
+										.skip(2)
+                                        .map(|c| *c as u8)
+                                        .collect::<Vec<_>>();
+                                    let b = hex::decode(data).map_err(|_| {
+                                        log::info!("🐙 Not a valid hex string");
+                                        Option::<ValidatorSet<<T as frame_system::Config>::AccountId>>::None
+                                    }).ok()?;
+                                    <T as frame_system::Config>::AccountId::decode(
+                                        &mut &b[..],
+                                    )
+                                    .ok()
+                                }
+                                _ => None,
+                            });
+                        let amount = obj
+                            .clone()
+                            .into_iter()
+                            .find(|(k, _)| {
+                                let mut amount = "amount".chars();
+                                k.iter().all(|k| Some(*k) == amount.next())
+                            })
+                            .and_then(|v| match v.1 {
+                                JsonValue::String(s) => {
+                                    let num_str: String = s.iter().collect();
+                                    let num: u64 = num_str.parse::<u64>().unwrap_or(0);
+                                    Some(num)
+                                },
+                                _ => None,
+                            });
+                        if seq_num.is_some() {
+                            let zero_number = NumberValue {
+                                integer: 0,
+                                fraction: 0,
+                                fraction_length: 0,
+                                exponent: 0
+                            };
+
+                            let zero_address_hex = hex::decode("0000000000000000000000000000000000000000000000000000000000000000").ok().unwrap();
+                            let zero_address = <T as frame_system::Config>::AccountId::decode(&mut &zero_address_hex[..]).unwrap();
+
+                            let seq_num = seq_num.unwrap_or(zero_number.clone()).integer as u32;
+                            let token_id = token_id.unwrap_or("INVALID".as_bytes().to_vec());
+                            // let appchain_id = appchain_id.expect("seq_num is invalid; qed").integer as u32;
+                            let amount = amount.unwrap_or(0);
+
+                            let receiver_id = receiver_id.unwrap_or(zero_address);
+                            events.push(LockedEvent {
+                                sequence_number: seq_num,
+                                token_id: token_id,
+                                receiver_id: receiver_id,
+                                amount: amount
+                            });
+                        }
+                    }
+                    _ => (),
+                });
+                Some(0)
+            }
+            _ => None
+        });
+        Some(events)
+    }
 
 	fn parse_validator_set(
 		body_str: &str,
@@ -720,6 +1095,31 @@ impl<T: Config> Module<T> {
 			.propagate(true)
 			.build()
 	}
+
+	fn validate_locked_events_transaction_parameters(
+        block_number: &T::BlockNumber,
+		_events: &Vec<LockedEvent<<T as frame_system::Config>::AccountId>>,
+		account_id: <T as frame_system::Config>::AccountId,
+    ) -> TransactionValidity {
+        // Let's make sure to reject transactions from the future.
+		let current_block = <system::Pallet<T>>::block_number();
+		if &current_block < block_number {
+			log::info!(
+				"🐙 InvalidTransaction => current_block: {:?}, block_number: {:?}",
+				current_block,
+				block_number
+			);
+			return InvalidTransaction::Future.into();
+		}
+
+        ValidTransaction::with_tag_prefix("OctopusAppchain")
+			.priority(T::UnsignedPriority::get().saturating_add(Self::locked_events_length() as _))
+			.and_provides((Self::locked_events_length(), account_id))
+			.longevity(5)
+			.propagate(true)
+			.build()
+
+    }
 }
 
 #[allow(deprecated)] // ValidateUnsigned
@@ -744,7 +1144,18 @@ impl<T: Config> frame_support::unsigned::ValidateUnsigned for Module<T> {
 				&payload.val_set,
 				payload.public.clone().into_account(),
 			)
-		} else {
+		} else if let Call::submit_locked_events(ref payload, ref signature) = call  {
+            let signature_valid =
+				SignedPayload::<T>::verify::<T::AppCrypto>(payload, signature.clone());
+			if !signature_valid {
+				return InvalidTransaction::BadProof.into();
+			}
+            Self::validate_locked_events_transaction_parameters(
+				&payload.block_number,
+				&payload.events,
+				payload.public.clone().into_account(),
+			)
+        } else {
 			InvalidTransaction::Call.into()
 		}
 	}
