@@ -35,7 +35,7 @@ hex = { default-features = false, version = '0.4', features = ['alloc'] }
 lite-json = { default-features = false, version = '0.1' }
 serde = { optional = true, version = '1.0.119' }
 
-pallet-assets = { path = '../pallet-assets', default-features = false }
+pallet-assets = { git = 'https://github.com/czl1378/pallet-assets.git', default-features = false }
 
 [dev-dependencies]
 sp-keystore = { default-features = false, version = '0.9.0' }
